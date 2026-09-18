@@ -1,12 +1,22 @@
-"""特征工程：时间特征、滞后特征、窗口特征、归一化、特征选择。"""
-from dataclasses import dataclass
-from typing import List
+"""特征工程：时间序列特征提取、特征归一化、特征选择。
+
+对应实验指导书"二、特征工程"：
+  1. 时间序列特征提取：四季/月份编码、滞后特征、窗口特征
+  2. 特征归一化：最小-最大归一化（MinMax）与 Z-score 标准化
+  3. 特征选择：皮尔逊相关系数法与互信息法
+
+同时产出两套对齐的样本：
+  - 扁平特征 (n, F)：供 MLP / 随机森林使用
+  - 序列特征 (n, L, C)：供 LSTM 使用
+"""
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
 
 from . import config
+from .data_loader import load_data
 
 TARGET = config.TARGET
 LOOKBACK = config.LOOKBACK
@@ -17,288 +27,344 @@ HORIZON = config.HORIZON
 # 1. 时间序列特征提取
 # ----------------------------------------------------------------------
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    """对四季和月份进行编码（三角化 + 季节 one-hot）。"""
+    """对四季和月份进行编码：月份/年内日序三角化 + 季节 one-hot。"""
     out = df.copy()
     month = out.index.month.to_numpy()
-    dayofyear = out.index.dayofyear.to_numpy()
-    # 月份三角化编码
+    doy = out.index.dayofyear.to_numpy()
     out["month_sin"] = np.sin(2 * np.pi * month / 12)
     out["month_cos"] = np.cos(2 * np.pi * month / 12)
-    # 年内日序三角化
-    out["doy_sin"] = np.sin(2 * np.pi * dayofyear / 365.25)
-    out["doy_cos"] = np.cos(2 * np.pi * dayofyear / 365.25)
-    # 季节 one-hot（3-5 春=1，6-8 夏=2，9-11 秋=3，12-2 冬=4）
+    out["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
+    out["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
+    # 季节：3-5 春，6-8 夏，9-11 秋，12-2 冬
     season = np.where((month >= 3) & (month <= 5), 1,
              np.where((month >= 6) & (month <= 8), 2,
              np.where((month >= 9) & (month <= 11), 3, 4)))
-    for s, name in zip([1, 2, 3, 4], ["spring", "summer", "autumn", "winter"]):
-        out[f"season_{name}"] = (season == s).astype(int)
+    for code, name in zip([1, 2, 3, 4], ["spring", "summer", "autumn", "winter"]):
+        out[f"season_{name}"] = (season == code).astype(float)
     return out
 
 
-def add_lag_and_window_features(df: pd.DataFrame) -> pd.DataFrame:
-    """提取滞后特征和窗口（滚动）特征。"""
+def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    """滞后特征：对数径流 lag0~lag7、径流涨落率、气象要素近期滞后。"""
     out = df.copy()
-    # 滞后特征：径流的 lag 0..LOOKBACK
+    logq = np.log(out[TARGET])
     for lag in range(LOOKBACK + 1):
-        out[f"{TARGET}_lag{lag}"] = out[TARGET].shift(lag)
-    # 窗口特征：过去 LOOKBACK 天的均值/标准差/最大值
-    roll = out[TARGET].rolling(LOOKBACK)
-    out[f"{TARGET}_roll_mean"] = roll.mean().shift(1)
-    out[f"{TARGET}_roll_std"] = roll.std().shift(1)
-    out[f"{TARGET}_roll_max"] = roll.max().shift(1)
-    # 降水窗口累计
-    out["Prcp_roll_sum"] = out["Prcp"].rolling(LOOKBACK).sum().shift(1)
+        out[f"logQ_lag{lag}"] = logq.shift(lag)
+    # 涨落率：区分洪水的涨水段与退水段，对多步预测非常关键
+    out["dlogQ_1"] = logq.diff(1)
+    out["dlogQ_1_prev"] = logq.diff(1).shift(1)
+    out["dlogQ_3"] = logq.diff(3)
+    for col in config.FORCING_COLS:
+        for lag in range(1, 4):
+            out[f"{col}_lag{lag}"] = out[col].shift(lag)
     return out
+
+
+def add_window_features(df: pd.DataFrame) -> pd.DataFrame:
+    """窗口（滚动）特征：径流统计量、前期降水指数、正积温（融雪代理）。"""
+    out = df.copy()
+    logq = np.log(out[TARGET])
+    for w in config.ROLL_WINDOWS:
+        roll = logq.rolling(w)
+        out[f"logQ_mean{w}"] = roll.mean()
+        out[f"logQ_std{w}"] = roll.std()
+        out[f"logQ_max{w}"] = roll.max()
+        out[f"logQ_min{w}"] = roll.min()
+        # 前期降水指数 API：流域蓄水状态的代理量
+        out[f"Prcp_sum{w}"] = out["Prcp"].rolling(w).sum()
+        out[f"Tmax_mean{w}"] = out["Tmax"].rolling(w).mean()
+    # 正积温：融雪径流的主要驱动
+    pdd = out["Tmax"].clip(lower=0)
+    out["PDD"] = pdd
+    for w in [3, 7, 14]:
+        out[f"PDD_sum{w}"] = pdd.rolling(w).sum()
+    out["frozen_days7"] = (out["Tmax"] < 0).rolling(7).sum()
+    # 降雨与融雪的联合作用（雨夹雪/雨引发融雪）
+    out["Prcp_x_PDD"] = out["Prcp"] * pdd
+    return out
+
+
+def add_future_forcing(df: pd.DataFrame) -> pd.DataFrame:
+    """未来气象强迫（"完美预报"假设）：未来 1~HORIZON 天的降水与正积温。
+
+    径流预报的业务流程是"数值天气预报 → 水文模型 → 流量预报"，
+    未来降水是必备输入；此处以实测气象代替预报值。
+    """
+    out = df.copy()
+    pdd = out["Tmax"].clip(lower=0)
+    for h in range(1, HORIZON + 1):
+        out[f"fut_Prcp_{h}"] = out["Prcp"].shift(-h)
+        out[f"fut_PDD_{h}"] = pdd.shift(-h)
+    out["fut_Prcp_sum"] = sum(out["Prcp"].shift(-h) for h in range(1, HORIZON + 1))
+    out["fut_PDD_sum"] = sum(pdd.shift(-h) for h in range(1, HORIZON + 1))
+    return out
+
+
+def build_feature_frame(use_future_forcing: Optional[bool] = None) -> pd.DataFrame:
+    """加载原始数据并完成全部特征构造，返回含目标列的特征表。"""
+    if use_future_forcing is None:
+        use_future_forcing = config.USE_FUTURE_FORCING
+    df = load_data()
+    # Swe 全为 0，无信息量，剔除
+    df = df.drop(columns=[c for c in ["Swe"] if c in df.columns])
+    df = add_time_features(df)
+    df = add_lag_features(df)
+    df = add_window_features(df)
+    if use_future_forcing:
+        df = add_future_forcing(df)
+    return df
 
 
 # ----------------------------------------------------------------------
 # 2. 特征归一化
 # ----------------------------------------------------------------------
+# 常用方法小结：
+#   - 最小-最大归一化 (MinMax)：线性映射到 [0,1]，保留原分布形状，对异常值敏感
+#   - Z-score 标准化：减均值除标准差，得到零均值单位方差，受异常值影响较小
+#   - 最大绝对值 / 稳健(分位数)缩放：适合稀疏或重尾数据
+# 本项目默认使用 MinMax（仅在训练集上拟合，再应用到测试集，避免信息泄漏）。
 @dataclass
-class Normalizer:
-    """最小-最大归一化（按列保存 min/max）。"""
+class MinMaxNormalizer:
+    """最小-最大归一化：x' = (x - min) / (max - min)。"""
     mins: np.ndarray = None
     maxs: np.ndarray = None
     cols: List[str] = None
 
-    def fit(self, X: np.ndarray, cols: List[str]):
+    def fit(self, X: np.ndarray, cols: Optional[List[str]] = None):
         self.cols = cols
-        self.mins = X.min(axis=0)
-        self.maxs = X.max(axis=0)
+        self.mins = np.nanmin(X, axis=0)
+        self.maxs = np.nanmax(X, axis=0)
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         rng = np.where(self.maxs - self.mins < 1e-9, 1.0, self.maxs - self.mins)
         return (X - self.mins) / rng
 
+    def fit_transform(self, X, cols=None):
+        return self.fit(X, cols).transform(X)
 
-def zscore_standardize(X: np.ndarray):
-    """Z-score 标准化（返回标准化后数据及统计量）。"""
-    mean = X.mean(axis=0)
-    std = X.std(axis=0)
-    std = np.where(std < 1e-9, 1.0, std)
-    return (X - mean) / std, mean, std
+
+@dataclass
+class ZScoreNormalizer:
+    """Z-score 标准化：x' = (x - mean) / std。"""
+    mean: np.ndarray = None
+    std: np.ndarray = None
+    cols: List[str] = None
+
+    def fit(self, X: np.ndarray, cols: Optional[List[str]] = None):
+        self.cols = cols
+        self.mean = np.nanmean(X, axis=0)
+        self.std = np.where(np.nanstd(X, axis=0) < 1e-9, 1.0, np.nanstd(X, axis=0))
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        return (X - self.mean) / self.std
+
+    def fit_transform(self, X, cols=None):
+        return self.fit(X, cols).transform(X)
 
 
 # ----------------------------------------------------------------------
 # 3. 特征选择
 # ----------------------------------------------------------------------
-def pearson_select(features: pd.DataFrame, y: pd.Series, k: int = 15) -> List[str]:
-    """皮尔逊相关系数法：选择与目标相关性绝对值最大的 k 个特征。"""
-    corrs = features.corrwith(y).abs().sort_values(ascending=False)
-    return corrs.head(k).index.tolist()
+# 常用方法小结：
+#   - 过滤式：皮尔逊相关系数（线性相关）、互信息（含非线性）、方差阈值、卡方
+#   - 包裹式：递归特征消除 RFE、前向/后向搜索
+#   - 嵌入式：Lasso 系数、树模型特征重要性
+# 本项目实现皮尔逊相关系数法与互信息法；为避免信息泄漏，只在训练集样本上做选择。
+#
+# 注意：径流滞后项之间相关系数普遍 > 0.95，若只按"与目标相关性"排序取 Top-k，
+# 结果几乎全是彼此冗余的滞后项，而降水等互补信息会被挤出。因此在打分之后
+# 再做一步贪心冗余剔除（相关性高于阈值的候选跳过），即 max-relevance/min-redundancy 思路。
+REDUNDANCY_THRESHOLD = 0.95
 
 
-def mutual_info_select(features: pd.DataFrame, y: pd.Series, k: int = 15) -> List[str]:
-    """互信息法选择特征。"""
+def _greedy_pick(scores: pd.Series, features: pd.DataFrame, k: int,
+                 threshold: float = REDUNDANCY_THRESHOLD) -> List[str]:
+    """按得分从高到低贪心选取，跳过与已选特征相关性超过阈值的候选。"""
+    corr = features.corr().abs().fillna(0.0)
+    picked: List[str] = []
+    for col in scores.sort_values(ascending=False).index:
+        if len(picked) >= k:
+            break
+        if picked and corr.loc[col, picked].max() > threshold:
+            continue
+        picked.append(col)
+    return picked
+
+
+def pearson_scores(features: pd.DataFrame, Y: np.ndarray) -> pd.Series:
+    """各特征与目标的皮尔逊相关系数（取各预见期中的最大 |r|）。"""
+    scores = [features.corrwith(pd.Series(np.log(Y[:, h]), index=features.index)).abs()
+              for h in range(Y.shape[1])]
+    return pd.concat(scores, axis=1).max(axis=1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def mutual_info_scores(features: pd.DataFrame, Y: np.ndarray) -> pd.Series:
+    """各特征与目标的互信息（取各预见期中的最大值），可捕捉非线性依赖。"""
     from sklearn.feature_selection import mutual_info_regression
-    mi = mutual_info_regression(features.fillna(0), y, random_state=config.SEED)
-    s = pd.Series(mi, index=features.columns).sort_values(ascending=False)
-    return s.head(k).index.tolist()
+    mi = [mutual_info_regression(features.values, np.log(Y[:, h]), random_state=config.SEED)
+          for h in range(Y.shape[1])]
+    return pd.Series(np.max(mi, axis=0), index=features.columns)
+
+
+def pearson_select(features: pd.DataFrame, Y: np.ndarray, k: int = 30) -> List[str]:
+    """皮尔逊相关系数法 + 冗余剔除。"""
+    return _greedy_pick(pearson_scores(features, Y), features, k)
+
+
+def mutual_info_select(features: pd.DataFrame, Y: np.ndarray, k: int = 30) -> List[str]:
+    """互信息法 + 冗余剔除。"""
+    return _greedy_pick(mutual_info_scores(features, Y), features, k)
+
+
+def select_features(features: pd.DataFrame, Y: np.ndarray,
+                    method: str = "pearson", k: int = 30) -> List[str]:
+    if method == "pearson":
+        return pearson_select(features, Y, k)
+    if method == "mi":
+        return mutual_info_select(features, Y, k)
+    return list(features.columns)
 
 
 # ----------------------------------------------------------------------
-# 构建监督学习样本
+# 4. 监督样本构造与按时间切分
 # ----------------------------------------------------------------------
 def build_supervised(df: pd.DataFrame, feature_cols: List[str]):
-    """
-    构建监督学习样本：
-      X[i] = 时刻 t 的特征（已含滞后/窗口/时间编码）
-      Y[i] = [Discharge[t+1], ..., Discharge[t+HORIZON]]
-    origin t 取自 df.index，要求 t-HORIZON..t+HORIZON 均存在。
-    """
-    X, Y, origins = [], [], []
-    vals = df[feature_cols].values
-    tgt = df[TARGET].values
-    idx = df.index
+    """X[i] = 时刻 t 的特征向量；Y[i] = [Q(t+1), ..., Q(t+HORIZON)]。"""
+    vals = df[feature_cols].to_numpy(dtype=float)
+    tgt = df[TARGET].to_numpy(dtype=float)
     n = len(df)
-    for t in range(n):
-        if t + HORIZON >= n:
-            break
-        X.append(vals[t])
-        Y.append(tgt[t + 1: t + 1 + HORIZON])
-        origins.append(idx[t])
-    X = np.array(X)
-    Y = np.array(Y)
-    origins = pd.DatetimeIndex(origins)
-    return X, Y, origins
+    n_samples = n - HORIZON
+    X = vals[:n_samples]
+    Y = np.stack([tgt[t + 1: t + 1 + HORIZON] for t in range(n_samples)])
+    return X, Y, df.index[:n_samples]
 
 
-def split_by_time(origins: pd.DatetimeIndex, X: np.ndarray, Y: np.ndarray):
-    """
-    按时间顺序切分：origin 时刻落在训练期/测试期。
-    训练集：origin 时刻 <= TRAIN_END_YEAR 且其预测窗口完全在训练年内
-    测试集：origin 时刻的预测窗口完全落在 TEST_YEAR 内
-    """
-    train_mask = origins.year <= config.TRAIN_END_YEAR
-    # 测试 origin：t+1..t+HORIZON 全部落在 TEST_YEAR
-    test_mask = pd.DatetimeIndex([
-        origins[i] + pd.Timedelta(days=h) for i in range(len(origins)) for h in [1]
-    ])
-    # 用 origin + HORIZON 天判断窗口末端
-    end_window = origins + pd.Timedelta(days=config.HORIZON)
-    start_window = origins + pd.Timedelta(days=1)
-    test_mask = (start_window.year == config.TEST_YEAR) & (end_window.year == config.TEST_YEAR)
-    return (X[train_mask], Y[train_mask], origins[train_mask],
-            X[test_mask], Y[test_mask], origins[test_mask])
+def build_sequences(df: pd.DataFrame, use_future_forcing: bool):
+    """LSTM 的 3D 序列样本。
 
+    编码窗口为 [t-LOOKBACK+1, t]；若使用未来气象强迫，则再向后拼接
+    [t+1, t+HORIZON] 共 HORIZON 步，其中径流通道用 t 时刻值保持（未知），
+    气象通道用实测（预报）值，并附 is_future 标志位区分两段。
+    """
+    logq = np.log(df[TARGET]).to_numpy(dtype=float)
+    pdd = df["Tmax"].clip(lower=0).to_numpy(dtype=float)
+    forcing = df[config.FORCING_COLS].to_numpy(dtype=float)
+    channels = np.column_stack([logq, pdd, forcing])  # (n, C-1)
+    tgt = df[TARGET].to_numpy(dtype=float)
+    n, c = channels.shape
+    steps = LOOKBACK + (HORIZON if use_future_forcing else 0)
 
-def build_sequences(df: pd.DataFrame, seq_cols: List[str]):
-    """
-    为 LSTM 构造 3D 序列样本：
-      X[i] = [seq[t-LOOKBACK+1], ..., seq[t]]  形状 (LOOKBACK, F)
-      Y[i] = [Discharge[t+1], ..., Discharge[t+HORIZON]]
-    """
-    data = df[seq_cols].values
-    tgt = df[TARGET].values
-    idx = df.index
-    n = len(df)
     X, Y, origins = [], [], []
-    for t in range(LOOKBACK - 1, n):
-        if t + HORIZON >= n:
-            break
-        X.append(data[t - LOOKBACK + 1: t + 1])
+    for t in range(LOOKBACK - 1, n - HORIZON):
+        hist = channels[t - LOOKBACK + 1: t + 1]
+        if use_future_forcing:
+            fut = channels[t + 1: t + 1 + HORIZON].copy()
+            fut[:, 0] = channels[t, 0]  # 未来径流未知，用 t 时刻值占位
+            seq = np.vstack([hist, fut])
+            flag = np.concatenate([np.zeros(LOOKBACK), np.ones(HORIZON)])[:, None]
+            seq = np.hstack([seq, flag])
+        else:
+            seq = np.hstack([hist, np.zeros((LOOKBACK, 1))])
+        X.append(seq)
         Y.append(tgt[t + 1: t + 1 + HORIZON])
-        origins.append(idx[t])
-    return np.array(X), np.array(Y), pd.DatetimeIndex(origins)
+        origins.append(df.index[t])
+    X = np.asarray(X, dtype=float)
+    assert X.shape[1] == steps and X.shape[2] == c + 1
+    return X, np.asarray(Y, dtype=float), pd.DatetimeIndex(origins)
 
 
-def prepare_sequence_dataset():
-    """为 LSTM 准备 3D 序列数据，并按时间切分 + 归一化。"""
-    from .data_loader import load_data
-    df = load_data()
-    seq_cols = [TARGET] + ["Prcp", "Tmax", "Tmin", "Srad", "Vp", "Dayl"]
-    X, Y, origins = build_sequences(df, seq_cols)
-    # 按 origin 时间切分
-    end_window = origins + pd.Timedelta(days=config.HORIZON)
-    start_window = origins + pd.Timedelta(days=1)
-    train_mask = origins.year <= config.TRAIN_END_YEAR
-    test_mask = (start_window.year == config.TEST_YEAR) & (end_window.year == config.TEST_YEAR)
-    Xtr, Ytr = X[train_mask], Y[train_mask]
-    Xte, Yte = X[test_mask], Y[test_mask]
-
-    # 在训练集上拟合 MinMax 归一化（按特征列）
-    n_feat = Xtr.shape[2]
-    mins = Xtr.reshape(-1, n_feat).min(axis=0)
-    maxs = Xtr.reshape(-1, n_feat).max(axis=0)
-    rng = np.where(maxs - mins < 1e-9, 1.0, maxs - mins)
-    Xtr_n = (Xtr - mins) / rng
-    Xte_n = (Xte - mins) / rng
-    info = {
-        "seq_cols": seq_cols,
-        "n_features": len(seq_cols),
-        "lookback": config.LOOKBACK,
-        "n_train": len(Xtr),
-        "n_test": len(Xte),
-    }
-    return Xtr_n, Ytr, Xte_n, Yte, info
+def time_split_masks(origins: pd.DatetimeIndex):
+    """按时间先后切分：训练集 origin 在前 4 年；测试集预测窗口完整落在测试年内。"""
+    train_mask = np.asarray(origins.year <= config.TRAIN_END_YEAR)
+    start = origins + pd.Timedelta(days=1)
+    end = origins + pd.Timedelta(days=HORIZON)
+    test_mask = np.asarray((start.year == config.TEST_YEAR) & (end.year == config.TEST_YEAR))
+    return train_mask, test_mask
 
 
-def prepare_both(use_selection: str = "pearson", k: int = 20):
-    """
-    同时构建扁平特征与序列特征，并保证两者样本按相同 origin 对齐。
-    返回: (Xtr_flat, Ytr, Xte_flat, Yte, Xtr_seq, Xte_seq, info)
-    """
-    from .data_loader import load_data
-    df = load_data()
-    df_time = add_time_features(df)
-    df_feat = add_lag_and_window_features(df_time)
-    df_clean = df_feat.dropna()
+# ----------------------------------------------------------------------
+# 5. 端到端数据准备
+# ----------------------------------------------------------------------
+@dataclass
+class Dataset:
+    """训练/测试数据容器（扁平特征与序列特征按同一组 origin 对齐）。"""
+    X_train: np.ndarray
+    Y_train: np.ndarray
+    X_test: np.ndarray
+    Y_test: np.ndarray
+    S_train: np.ndarray
+    S_test: np.ndarray
+    origins_train: pd.DatetimeIndex
+    origins_test: pd.DatetimeIndex
+    q_now_test: np.ndarray          # 测试集 origin 当天实测流量（持续性基线用）
+    feature_cols: List[str] = field(default_factory=list)
+    info: dict = field(default_factory=dict)
 
-    # 扁平特征候选 + 特征选择
-    feature_cols = [c for c in df_clean.columns if c != TARGET]
-    y_series = df_clean[TARGET]
-    if use_selection == "pearson":
-        selected = pearson_select(df_clean[feature_cols], y_series, k=k)
-    elif use_selection == "mi":
-        selected = mutual_info_select(df_clean[feature_cols], y_series, k=k)
-    else:
-        selected = feature_cols
 
-    Xf, Y, origins = build_supervised(df_clean, selected)
+def prepare_dataset(method: Optional[str] = None, k: Optional[int] = None,
+                    use_future_forcing: Optional[bool] = None,
+                    normalizer: str = "minmax") -> Dataset:
+    """加载 → 特征工程 → 按时间切分 → 训练集上做特征选择与归一化。"""
+    method = method or config.SELECT_METHOD
+    k = k or config.N_SELECT
+    if use_future_forcing is None:
+        use_future_forcing = config.USE_FUTURE_FORCING
 
-    # 序列特征：从 df_time（含全部行）构造，再按 origin 对齐到扁平样本
-    seq_cols = [TARGET] + ["Prcp", "Tmax", "Tmin", "Srad", "Vp", "Dayl"]
-    Xs_all, Ys_all, origins_seq = build_sequences(df_time, seq_cols)
-    # 对齐 origins
-    seq_idx = {d: i for i, d in enumerate(origins_seq)}
-    keep = [seq_idx[d] for d in origins if d in seq_idx]
-    Xs = Xs_all[keep]
-    assert len(Xs) == len(Xf), (len(Xs), len(Xf))
+    df = build_feature_frame(use_future_forcing)
+    # 序列样本先于 dropna 构造，保证 LSTM 能用到完整历史
+    S_all, Y_seq, origins_seq = build_sequences(df, use_future_forcing)
 
-    # 按时间切分
-    end_window = origins + pd.Timedelta(days=config.HORIZON)
-    start_window = origins + pd.Timedelta(days=1)
-    train_mask = origins.year <= config.TRAIN_END_YEAR
-    test_mask = (start_window.year == config.TEST_YEAR) & (end_window.year == config.TEST_YEAR)
+    df_clean = df.dropna()
+    candidate_cols = [c for c in df_clean.columns if c != TARGET]
+    X_all, Y_all, origins = build_supervised(df_clean, candidate_cols)
 
-    Xtr_f, Ytr = Xf[train_mask], Y[train_mask]
-    Xte_f, Yte = Xf[test_mask], Y[test_mask]
-    Xtr_s = Xs[train_mask]
-    Xte_s = Xs[test_mask]
+    # 两套样本按 origin 对齐
+    pos = {d: i for i, d in enumerate(origins_seq)}
+    keep = np.array([i for i, d in enumerate(origins) if d in pos])
+    X_all, Y_all, origins = X_all[keep], Y_all[keep], origins[keep]
+    S_all = S_all[[pos[d] for d in origins]]
+    assert np.allclose(Y_all, Y_seq[[pos[d] for d in origins]])
 
-    # 扁平特征 MinMax 归一化
-    mins = Xtr_f.min(axis=0)
-    maxs = Xtr_f.max(axis=0)
-    rng = np.where(maxs - mins < 1e-9, 1.0, maxs - mins)
-    Xtr_f_n = (Xtr_f - mins) / rng
-    Xte_f_n = (Xte_f - mins) / rng
+    train_mask, test_mask = time_split_masks(origins)
+    Xtr_raw, Ytr = X_all[train_mask], Y_all[train_mask]
+    Xte_raw, Yte = X_all[test_mask], Y_all[test_mask]
+    Str_raw, Ste_raw = S_all[train_mask], S_all[test_mask]
 
-    # 序列特征 MinMax 归一化
-    n_feat = Xtr_s.shape[2]
-    s_mins = Xtr_s.reshape(-1, n_feat).min(axis=0)
-    s_maxs = Xtr_s.reshape(-1, n_feat).max(axis=0)
-    s_rng = np.where(s_maxs - s_mins < 1e-9, 1.0, s_maxs - s_mins)
-    Xtr_s_n = (Xtr_s - s_mins) / s_rng
-    Xte_s_n = (Xte_s - s_mins) / s_rng
+    # 特征选择：仅用训练集样本，目标为对数流量（抑制极值主导）
+    feat_df = pd.DataFrame(Xtr_raw, columns=candidate_cols)
+    selected = select_features(feat_df, Ytr, method, k)
+    # 保持与原特征表一致的列序，便于阅读
+    selected = [c for c in candidate_cols if c in selected]
+    col_idx = [candidate_cols.index(c) for c in selected]
+
+    Norm = MinMaxNormalizer if normalizer == "minmax" else ZScoreNormalizer
+    norm = Norm().fit(Xtr_raw[:, col_idx], selected)
+    Xtr = norm.transform(Xtr_raw[:, col_idx])
+    Xte = norm.transform(Xte_raw[:, col_idx])
+
+    # 序列特征按通道归一化（在训练集上拟合）
+    n_ch = Str_raw.shape[2]
+    snorm = Norm().fit(Str_raw.reshape(-1, n_ch))
+    Str = snorm.transform(Str_raw.reshape(-1, n_ch)).reshape(Str_raw.shape)
+    Ste = snorm.transform(Ste_raw.reshape(-1, n_ch)).reshape(Ste_raw.shape)
+
+    q_now = df_clean[TARGET].reindex(origins[test_mask]).to_numpy(dtype=float)
 
     info = {
-        "feature_cols": selected,
-        "n_features_flat": len(selected),
-        "n_features_seq": len(seq_cols),
-        "lookback": config.LOOKBACK,
-        "n_train": len(Xtr_f),
-        "n_test": len(Xte_f),
+        "n_candidate_features": len(candidate_cols),
+        "n_selected_features": len(selected),
+        "select_method": method,
+        "normalizer": normalizer,
+        "use_future_forcing": bool(use_future_forcing),
+        "log_target": bool(config.LOG_TARGET),
+        "seq_shape": list(Str.shape[1:]),
+        "n_train": int(len(Xtr)),
+        "n_test": int(len(Xte)),
         "train_period": f"{origins[train_mask].min().date()} ~ {origins[train_mask].max().date()}",
-        "test_period": f"{origins[test_mask].min().date()} ~ {origins[test_mask].max().date()}",
+        "test_period": f"{(origins[test_mask].min() + pd.Timedelta(days=1)).date()}"
+                       f" ~ {(origins[test_mask].max() + pd.Timedelta(days=HORIZON)).date()}",
     }
-    return Xtr_f_n, Ytr, Xte_f_n, Yte, Xtr_s_n, Xte_s_n, info
-
-
-def prepare_dataset(use_selection: str = "pearson", k: int = 20):
-    """端到端：加载→特征工程→特征选择→切分→归一化。"""
-    from .data_loader import load_data
-    df = load_data()
-    df = add_time_features(df)
-    df = add_lag_and_window_features(df)
-    df = df.dropna()
-
-    # 候选特征：去掉目标本身
-    feature_cols = [c for c in df.columns if c != TARGET]
-    # 与目标相关性
-    y_series = df[TARGET]
-    if use_selection == "pearson":
-        selected = pearson_select(df[feature_cols], y_series, k=k)
-    elif use_selection == "mi":
-        selected = mutual_info_select(df[feature_cols], y_series, k=k)
-    else:  # "all"
-        selected = feature_cols
-
-    X, Y, origins = build_supervised(df, selected)
-    Xtr, Ytr, otr, Xte, Yte, ote = split_by_time(origins, X, Y)
-
-    # 最小-最大归一化（仅在训练集上拟合）
-    norm = Normalizer().fit(Xtr, selected)
-    Xtr_n = norm.transform(Xtr)
-    Xte_n = norm.transform(Xte)
-
-    info = {
-        "feature_cols": selected,
-        "n_features": len(selected),
-        "n_train": len(Xtr),
-        "n_test": len(Xte),
-        "train_period": f"{otr.min().date()} ~ {otr.max().date()}",
-        "test_period": f"{ote.min().date()} ~ {ote.max().date()}",
-    }
-    return Xtr_n, Ytr, Xte_n, Yte, info
+    return Dataset(Xtr, Ytr, Xte, Yte, Str, Ste,
+                   origins[train_mask], origins[test_mask], q_now, selected, info)
